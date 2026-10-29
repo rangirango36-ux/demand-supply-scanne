@@ -1,243 +1,156 @@
-import streamlit as st
+import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
+import streamlit as st
 import yfinance as yf
-from datetime import datetime
+import requests
 
-st.set_page_config(
-    page_title="Demand & Supply Zone Scanner",
-    page_icon="📈",
-    layout="wide"
-)
-
+st.set_page_config(page_title="Demand & Supply Zone Scanner", page_icon="📈", layout="wide")
 st.title("📈 Demand & Supply Zone Scanner")
-st.caption("Rule-based candidate zones • Educational use only, not trading advice")
+st.subheader("Fresh Zone Radar")
+st.caption("Candidate zones only. Reachability rank is a heuristic, not a probability or trading advice.")
 
-st.info(
-    "Pattern rule: Leg In body < Base body < Leg Out body. "
-    "Zones use the base candle's full High–Low range. "
-    "This is a custom heuristic, not a verified GTF or trading system."
-)
+@st.cache_data(ttl=86400, show_spinner=False)
+def nifty500_symbols():
+    url = "https://en.wikipedia.org/wiki/NIFTY_500"
+    r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    for t in pd.read_html(io.StringIO(r.text)):
+        col = next((c for c in t.columns if str(c).strip().lower() in ("symbol", "ticker")), None)
+        if col is not None:
+            vals = t[col].dropna().astype(str).str.strip().tolist()
+            vals = [x for x in vals if x and x.upper() not in ("SYMBOL", "TICKER")]
+            if len(vals) >= 400:
+                return sorted(set(vals))
+    raise ValueError("Could not load the Nifty 500 list. Try again later.")
+
+def clean(raw):
+    if raw is None or raw.empty: return pd.DataFrame()
+    if isinstance(raw.columns, pd.MultiIndex): raw.columns = raw.columns.get_level_values(0)
+    raw.columns = [str(c).lower() for c in raw.columns]
+    raw = raw.loc[:, ~pd.Index(raw.columns).duplicated()]
+    cols = ["open", "high", "low", "close"]
+    if any(c not in raw.columns for c in cols): return pd.DataFrame()
+    raw = raw[cols].dropna().sort_index()
+    return raw[~raw.index.duplicated(keep="last")]
 
 @st.cache_data(ttl=900, show_spinner=False)
-def download_history(symbol: str, timeframe: str):
-    ticker = symbol if "." in symbol else symbol + ".NS"
-    settings = {
-        "Monthly": ("1mo", "max"),
-        "Weekly": ("1wk", "max"),
-        "Daily": ("1d", "max"),
-        "15m": ("15m", "60d"),
-        "125m": ("5m", "60d"),
-    }
-    interval, period = settings[timeframe]
-    df = yf.download(
-        ticker, period=period, interval=interval,
-        auto_adjust=False, progress=False, threads=False
-    )
-    if df.empty:
-        raise ValueError(
-            f"No data returned for {ticker}. Check the symbol or try another timeframe."
-        )
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df.columns = [str(c).lower() for c in df.columns]
-    df = df.loc[:, ~pd.Index(df.columns).duplicated()]
-    required = ["open", "high", "low", "close"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Downloaded data is missing columns: {missing}")
-    df = df[required].dropna().sort_index()
-    df = df[~df.index.duplicated(keep="last")]
+def stock_data(symbol, tf):
+    ticker = symbol + ".NS"
+    if tf == "Daily":
+        return ticker, clean(yf.download(ticker, period="max", interval="1d", progress=False, auto_adjust=False, threads=False))
+    raw = clean(yf.download(ticker, period="60d", interval="5m", progress=False, auto_adjust=False, threads=False))
+    if raw.empty: return ticker, raw
+    pieces = []
+    for _, session in raw.groupby(raw.index.date):
+        session = session.between_time("09:15", "15:30")
+        if session.empty: continue
+        bars = session.resample("125min", origin="start_day", offset="9h15min", label="left", closed="left").agg(
+            {"open":"first","high":"max","low":"min","close":"last"}).dropna()
+        pieces.append(bars)
+    return ticker, pd.concat(pieces).sort_index() if pieces else pd.DataFrame()
 
-    if timeframe in ("15m", "125m"):
-        if timeframe == "125m":
-            pieces = []
-            for _, session in df.groupby(df.index.date):
-                session = session.between_time("09:15", "15:30")
-                if session.empty:
-                    continue
-                candles = session.resample(
-                    "125min", origin="start_day", offset="9h15min",
-                    label="left", closed="left"
-                ).agg({
-                    "open": "first", "high": "max",
-                    "low": "min", "close": "last"
-                }).dropna()
-                pieces.append(candles)
-            if not pieces:
-                raise ValueError("Could not create 125-minute candles from the downloaded data.")
-            df = pd.concat(pieces).sort_index()
-        else:
-            df = df.between_time("09:15", "15:30")
-    return ticker, df
-
-def find_zones(df: pd.DataFrame):
-    zones = []
-    if len(df) < 3:
-        return zones
-    body = (df["close"] - df["open"]).abs()
-
-    for i in range(1, len(df) - 1):
-        leg_in = df.iloc[i - 1]
-        base = df.iloc[i]
-        leg_out = df.iloc[i + 1]
-
-        li_body = float(body.iloc[i - 1])
-        base_body = float(body.iloc[i])
-        lo_body = float(body.iloc[i + 1])
-
-        if min(li_body, base_body, lo_body) <= 0:
-            continue
-        if not (li_body < base_body < lo_body):
-            continue
-
-        demand = (
-            float(leg_out["close"]) > float(base["high"])
-            and float(leg_out["close"]) > float(leg_out["open"])
-        )
-        supply = (
-            float(leg_out["close"]) < float(base["low"])
-            and float(leg_out["close"]) < float(leg_out["open"])
-        )
-        if not (demand or supply):
-            continue
-
-        zones.append({
-            "Type": "DEMAND" if demand else "SUPPLY",
-            "Formed At": df.index[i],
-            "Low": float(base["low"]),
-            "High": float(base["high"]),
-            "Leg In Body": li_body,
-            "Base Body": base_body,
-            "Leg Out Body": lo_body,
-            "Touches": 0,
-            "First Touch": pd.NaT,
-            "Last Touch": pd.NaT,
-            "Broken At": pd.NaT,
-            "Status": "FRESH",
-        })
-
-    for zone in zones:
-        future = df.loc[df.index > df.index[df.index.get_loc(zone["Formed At"]) + 1]] if False else df.loc[df.index > zone["Formed At"]]
-        # Ignore the base candle and the departure candle when assessing later touches.
-        formed_pos = df.index.get_loc(zone["Formed At"])
-        future = df.iloc[formed_pos + 2:]
-        touch_count = 0
-
-        for timestamp, candle in future.iterrows():
-            low, high, close = float(candle["low"]), float(candle["high"]), float(candle["close"])
-            if zone["Type"] == "DEMAND":
-                broken = close < zone["Low"]
-            else:
-                broken = close > zone["High"]
-
-            if broken:
-                zone["Status"] = "BROKEN"
-                zone["Broken At"] = timestamp
-                break
-
-            overlaps = low <= zone["High"] and high >= zone["Low"]
-            if overlaps:
-                touch_count += 1
-                if pd.isna(zone["First Touch"]):
-                    zone["First Touch"] = timestamp
-                zone["Last Touch"] = timestamp
-
-        zone["Touches"] = touch_count
-        if zone["Status"] != "BROKEN":
-            if touch_count == 0:
-                zone["Status"] = "FRESH"
-            elif touch_count == 1:
-                zone["Status"] = "TOUCHED"
-            else:
-                zone["Status"] = "USED"
+def detect_zones(df):
+    zones=[]
+    if len(df)<3: return zones
+    bodies=(df["close"]-df["open"]).abs()
+    for i in range(1,len(df)-1):
+        a,b,c=float(bodies.iloc[i-1]),float(bodies.iloc[i]),float(bodies.iloc[i+1])
+        if min(a,b,c)<=0 or not (a<b<c): continue
+        base, out=df.iloc[i],df.iloc[i+1]
+        demand=float(out.close)>float(base.high) and float(out.close)>float(out.open)
+        supply=float(out.close)<float(base.low) and float(out.close)<float(out.open)
+        if demand or supply:
+            zones.append({"Zone":"DEMAND" if demand else "SUPPLY","Formed At":df.index[i],
+                          "Low":float(base.low),"High":float(base.high)})
     return zones
 
+def radar_rows(df,zones,symbol,tf):
+    if df.empty: return []
+    current=float(df.close.iloc[-1])
+    avg_range=(df.high-df.low).rolling(14).mean().iloc[-1]
+    if pd.isna(avg_range) or avg_range<=0: avg_range=float((df.high-df.low).tail(20).mean())
+    if pd.isna(avg_range) or avg_range<=0: return []
+    rows=[]
+    for z in zones:
+        pos=df.index.get_loc(z["Formed At"])
+        future=df.iloc[pos+2:]  # ignore base and leg-out candles
+        if future.empty: continue
+        if z["Zone"]=="DEMAND":
+            touched=((future.low<=z["High"])&(future.high>=z["Low"])).any()
+            broken=(future.close<z["Low"]).any()
+            if touched or broken or current<=z["High"]: continue
+            distance=current-z["High"]; direction="Price would need to fall"
+        else:
+            touched=((future.high>=z["Low"])&(future.low<=z["High"])).any()
+            broken=(future.close>z["High"]).any()
+            if touched or broken or current>=z["Low"]: continue
+            distance=z["Low"]-current; direction="Price would need to rise"
+        pct=distance/current*100 if current else 999
+        if pct>(8 if tf=="Daily" else 4): continue
+        units=distance/avg_range
+        rank="HIGHER relative proximity" if units<=1 else ("MODERATE relative proximity" if units<=2 else "LOWER relative proximity")
+        score=round(max(0,100-(units/2)*100),1)
+        rows.append({"Symbol":symbol,"Timeframe":tf,"Zone":z["Zone"],"Formed At":str(z["Formed At"]),
+                     "Zone Low":round(z["Low"],2),"Zone High":round(z["High"],2),"Current Price":round(current,2),
+                     "Distance %":round(pct,2),"Distance / Avg Range":round(units,2),"Direction":direction,
+                     "1–2 Day Reachability Rank":rank,"Rank Score (heuristic)":score})
+    return rows
+
 with st.sidebar:
-    st.header("Scan settings")
-    symbol = st.text_input("NSE symbol", value="RELIANCE", help="Examples: RELIANCE, TCS, STAR, SBIN").strip().upper()
-    timeframe = st.selectbox("Timeframe", ["Daily", "Weekly", "Monthly", "15m", "125m"], index=0)
-    run_scan = st.button("Scan zones", type="primary", use_container_width=True)
-    st.caption("Daily/Weekly/Monthly request maximum available history. Intraday history is limited by Yahoo Finance.")
+    st.header("Radar settings")
+    timeframes=st.multiselect("Timeframes",["Daily","125m"],default=["Daily","125m"])
+    max_stocks=st.select_slider("Stocks to scan",options=[25,50,100,200,500],value=50,
+        help="Start with 50. Scanning 500 symbols on both timeframes can be slow or rate-limited.")
+    run=st.button("Scan Fresh Zones",type="primary",use_container_width=True)
+    st.caption("Daily asks Yahoo Finance for maximum available history. Intraday history is limited, typically around 60 days for 5-minute data.")
 
-if run_scan:
-    if not symbol:
-        st.error("Please enter a stock symbol.")
-        st.stop()
-
+if run:
+    if not timeframes:
+        st.error("Select at least one timeframe."); st.stop()
     try:
-        with st.spinner(f"Downloading data and scanning {symbol}..."):
-            ticker, df = download_history(symbol, timeframe)
-            zones = find_zones(df)
-        st.session_state["scan_result"] = {
-            "ticker": ticker,
-            "timeframe": timeframe,
-            "df": df,
-            "zones": zones,
-        }
-    except Exception as exc:
-        st.error(f"Scan failed: {exc}")
-        st.stop()
+        with st.spinner("Loading Nifty 500 list..."): symbols=nifty500_symbols()
+        symbols=symbols[:max_stocks]
+        rows=[]; total=len(symbols)*len(timeframes); done=0
+        progress=st.progress(0,text="Starting scan...")
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            jobs={pool.submit(stock_data,s,tf):(s,tf) for s in symbols for tf in timeframes}
+            for fut in as_completed(jobs):
+                s,tf=jobs[fut]; done+=1
+                progress.progress(done/total,text=f"Checked {done} of {total} stock/timeframe requests...")
+                try:
+                    ticker,df=fut.result()
+                    if df.empty: continue
+                    rows.extend(radar_rows(df,detect_zones(df),s,tf))
+                except Exception:
+                    continue
+        progress.empty()
+        result=pd.DataFrame(rows)
+        if not result.empty:
+            result=result.sort_values(["Rank Score (heuristic)","Distance %"],ascending=[False,True]).reset_index(drop=True)
+        st.session_state["radar_result"]=result
+        st.session_state["radar_info"]={"count":len(symbols),"tfs":timeframes,"time":pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")}
+    except Exception as e:
+        st.error(f"Could not start scan: {e}"); st.stop()
 
-if "scan_result" not in st.session_state:
-    st.write("Enter a stock symbol in the sidebar and tap **Scan zones**.")
-    st.markdown("### What you will get")
-    st.markdown("- All detected candidate Demand and Supply zones\n- Fresh, Touched, Used and Broken counts\n- Filterable zone table\n- CSV export")
+if "radar_result" not in st.session_state:
+    st.info("Choose the timeframes and number of stocks in the sidebar, then tap Scan Fresh Zones.")
+    st.markdown("Rule used: Leg In body < Base body < Leg Out body; base candle High–Low defines the zone.")
     st.stop()
 
-data = st.session_state["scan_result"]
-df = data["df"]
-zones = data["zones"]
-result = pd.DataFrame(zones)
+res=st.session_state["radar_result"]; info=st.session_state["radar_info"]
+st.caption(f"Last scan: {info['time']} · Symbols requested: {info['count']} · Timeframes: {', '.join(info['tfs'])}")
+if res.empty:
+    st.warning("No fresh zones matched the filters in this batch. Scan more stocks or try again later."); st.stop()
 
-st.subheader(f"{data['ticker']} · {data['timeframe']}")
-st.caption(f"Data range: {df.index.min()} to {df.index.max()} · Candles analyzed: {len(df)}")
-
-if result.empty:
-    st.warning("No zones matched the selected rules in the downloaded data.")
-    st.stop()
-
-c1, c2, c3 = st.columns(3)
-c1.metric("All candidate zones", len(result))
-c2.metric("Demand zones", int((result["Type"] == "DEMAND").sum()))
-c3.metric("Supply zones", int((result["Type"] == "SUPPLY").sum()))
-
-st.markdown("### Zone status summary")
-summary_rows = []
-for ztype in ["DEMAND", "SUPPLY"]:
-    subset = result[result["Type"] == ztype]
-    row = {"Type": ztype, "Total": len(subset)}
-    for status in ["FRESH", "TOUCHED", "USED", "BROKEN"]:
-        row[status.title()] = int((subset["Status"] == status).sum())
-    summary_rows.append(row)
-st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-
-st.markdown("### All detected zones")
-filters = st.columns(3)
-with filters[0]:
-    type_filter = st.multiselect("Zone type", ["DEMAND", "SUPPLY"], default=["DEMAND", "SUPPLY"])
-with filters[1]:
-    status_filter = st.multiselect("Status", ["FRESH", "TOUCHED", "USED", "BROKEN"], default=["FRESH", "TOUCHED", "USED", "BROKEN"])
-with filters[2]:
-    search_text = st.text_input("Filter date (optional)", placeholder="e.g. 2024-")
-
-view = result[result["Type"].isin(type_filter) & result["Status"].isin(status_filter)].copy()
-view["Formed At"] = pd.to_datetime(view["Formed At"]).astype(str)
-for col in ["First Touch", "Last Touch", "Broken At"]:
-    view[col] = pd.to_datetime(view[col]).astype(str).replace("NaT", "")
-if search_text:
-    view = view[view["Formed At"].str.contains(search_text, case=False, na=False)]
-
-st.dataframe(view, use_container_width=True, hide_index=True)
-csv_bytes = result.to_csv(index=False).encode("utf-8")
-st.download_button(
-    "Download all zones as CSV",
-    data=csv_bytes,
-    file_name=f"{data['ticker'].replace('.', '_')}_{data['timeframe']}_all_zones.csv",
-    mime="text/csv",
-    use_container_width=True,
-)
-
-st.warning(
-    "This is a rule-based candidate scanner, not a verified trading system. "
-    "Status labels follow the code's rules and should be checked against charts before any trading decision."
-)
+a,b,c=st.columns(3)
+a.metric("Fresh candidates",len(res)); b.metric("Demand",int((res.Zone=="DEMAND").sum())); c.metric("Supply",int((res.Zone=="SUPPLY").sum()))
+st.markdown("### Filter candidates")
+f1,f2,f3=st.columns(3)
+with f1: types=st.multiselect("Zone type",["DEMAND","SUPPLY"],default=["DEMAND","SUPPLY"])
+with f2: tfs=st.multiselect("Timeframe",sorted(res.Timeframe.unique()),default=sorted(res.Timeframe.unique()))
+with f3: ranks=st.multiselect("Proximity rank",["HIGHER relative proximity","MODERATE relative proximity","LOWER relative proximity"],default=["HIGHER relative proximity","MODERATE relative proximity","LOWER relative proximity"])
+view=res[res.Zone.isin(types)&res.Timeframe.isin(tfs)&res["1–2 Day Reachability Rank"].isin(ranks)]
+st.dataframe(view,use_container_width=True,hide_index=True)
+st.download_button("Download candidates CSV",view.to_csv(index=False).encode("utf-8"),"fresh_zone_radar.csv","text/csv",use_container_width=True)
+st.warning("Reachability rank is a rough distance ÷ average candle range heuristic, not a probability or guaranteed 1–2 day forecast. Verify every zone on a chart before trading.")
