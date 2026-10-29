@@ -12,17 +12,40 @@ st.caption("Candidate zones only. Reachability rank is a heuristic, not a probab
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def nifty500_symbols():
-    url = "https://en.wikipedia.org/wiki/NIFTY_500"
-    r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    for t in pd.read_html(io.StringIO(r.text)):
-        col = next((c for c in t.columns if str(c).strip().lower() in ("symbol", "ticker")), None)
-        if col is not None:
-            vals = t[col].dropna().astype(str).str.strip().tolist()
-            vals = [x for x in vals if x and x.upper() not in ("SYMBOL", "TICKER")]
-            if len(vals) >= 400:
-                return sorted(set(vals))
-    raise ValueError("Could not load the Nifty 500 list. Try again later.")
+    # Prefer a raw CSV mirror of Nifty 500 constituents. Fall back to the official
+    # NSE archive CSV, then Wikipedia if either source is unavailable.
+    sources = [
+        ("https://raw.githubusercontent.com/BKKB20/nse-index-history/main/current_members/NIFTY_500.csv", "csv"),
+        ("https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv", "csv"),
+        ("https://en.wikipedia.org/wiki/NIFTY_500", "html"),
+    ]
+    errors = []
+    for url, kind in sources:
+        try:
+            r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            if kind == "csv":
+                table = pd.read_csv(io.BytesIO(r.content))
+                col = next((c for c in table.columns if str(c).strip().lower() in ("symbol", "ticker")), None)
+                if col is None and len(table.columns) == 1:
+                    col = table.columns[0]
+                if col is not None:
+                    vals = table[col].dropna().astype(str).str.strip().tolist()
+                    vals = [x for x in vals if x and x.upper() not in ("SYMBOL", "TICKER")]
+                    vals = [x for x in vals if x.replace(".", "").replace("-", "").replace("&", "").isalnum()]
+                    if len(set(vals)) >= 400:
+                        return sorted(set(vals))
+            else:
+                for table in pd.read_html(io.StringIO(r.text)):
+                    col = next((c for c in table.columns if str(c).strip().lower() in ("symbol", "ticker")), None)
+                    if col is not None:
+                        vals = table[col].dropna().astype(str).str.strip().tolist()
+                        vals = [x for x in vals if x and x.upper() not in ("SYMBOL", "TICKER")]
+                        if len(set(vals)) >= 400:
+                            return sorted(set(vals))
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+    raise ValueError("Could not load Nifty 500 symbols from the available sources. Try again later.")
 
 def clean(raw):
     if raw is None or raw.empty: return pd.DataFrame()
